@@ -1,0 +1,25 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net10.0-windows</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+		<!-- Включаем AOT и задаём тип библиотеки Shared -->
+		<PublishAot>true</PublishAot>
+		<NativeLib>Shared</NativeLib>
+
+		<!-- Отключаем лишние подсистемы .NET Host -->
+		<EnableDynamicLoading>true</EnableDynamicLoading>
+
+		<!-- Поддержка Windows Forms -->
+		<UseWindowsForms>true</UseWindowsForms>
+		<EnableWindowsTargeting>true</EnableWindowsTargeting>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="NAudio.Wasapi" Version="3.1.0" />
+	</ItemGroup>
+
+</Project>
