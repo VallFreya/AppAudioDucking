@@ -105,7 +105,7 @@ namespace ProcessMuterByChannel
 
             try
             {
-                obs_frontend_add_tools_menu_item("ProcessMuterByChannel", MenuCallbackDelegate, IntPtr.Zero);
+                obs_frontend_add_tools_menu_item("Process Muter By Channel", MenuCallbackDelegate, IntPtr.Zero);
                 LogInfo("Tools menu item registered.");
             }
             catch (Exception ex)
