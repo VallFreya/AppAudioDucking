@@ -58,7 +58,8 @@ namespace ProcessMuterByChannel
         // Цели: процессы Windows и звуковые источники OBS. Исходные громкости пишутся в файл восстановления
         private static readonly DuckingEngine Engine = new DuckingEngine(
             new RoutingBackend(), Plugin.LogInfo,
-            store: new RecoveryStore(Plugin.GetDataFilePath("ducked_volumes.txt")));
+            store: new RecoveryStore(Plugin.GetDataFilePath("ducked_volumes.txt")),
+            external: new PreviewRegistry());
 
         private static readonly VolmeterCallback DelegateCallback = OnVolmeterUpdated;
 
@@ -108,6 +109,8 @@ namespace ProcessMuterByChannel
             lock (SyncLock)
             {
                 _running = false;
+                VolumePreview.RestoreAll();   // предпросмотр уровня в окне настроек, если оно открыто в момент выгрузки
+                ObsLevelProbe.DisposeAll();   // измерители окна настроек, если оно открыто в момент выгрузки
                 _checkTimer?.Dispose();
                 _checkTimer = null;
 
@@ -117,6 +120,20 @@ namespace ProcessMuterByChannel
                 Engine.ReleaseAll();
             }
         }
+
+        /// <summary>
+        /// Цель сейчас приглушена (или возвращается) движком. Тогда original - громкость до приглушения: окно настроек
+        /// не должно принимать приглушённую громкость за исходную и не должно само менять громкость этой цели
+        /// </summary>
+        public static bool TryGetDuckedOriginal(string targetKey, out float original)
+        {
+            lock (SyncLock) return Engine.TryGetDuckedOriginal(targetKey, out original);
+        }
+
+        // Запись в файл восстановления из окна настроек. Берёт только блокировку самого файла восстановления, но не SyncLock:
+        // окно вызывает это из-под блокировки предпросмотра, а Stop держит SyncLock и ждёт эту блокировку (иначе взаимное ожидание)
+        internal static void NoteRecovery(string key, float baseVolume) => Engine.NoteRecovery(key, baseVolume);
+        internal static void ForgetRecovery(string key) => Engine.ForgetRecovery(key);
 
         /// <summary>Копия текущих фильтров для окна настроек</summary>
         public static List<FilterConfig> GetFilters()
@@ -140,9 +157,12 @@ namespace ProcessMuterByChannel
                 var usedProcesses = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var config in filters)
                 {
+                    if (config == null) continue;   // "null" в списке фильтров конфига, написанного вручную
+
                     var copy = config.Clone();
                     Filters.Add(new FilterRuntime(copy));
-                    if (copy.TargetKey.Length > 0) usedProcesses.Add(copy.TargetKey);
+                    // выключенный фильтр хранится (окно настроек его показывает), но цель не занимает: она вернётся к исходной громкости
+                    if (copy.enabled && copy.TargetKey.Length > 0) usedProcesses.Add(copy.TargetKey);
                 }
 
                 // процессы, которых больше нет в фильтрах, возвращаем к полной громкости
@@ -150,16 +170,32 @@ namespace ProcessMuterByChannel
 
                 Plugin.LogInfo($"Filters updated: {Filters.Count} filter(s)");
 
-                foreach (var filter in Filters) TryAttach(filter);
+                // Привязка идёт только пока плагин работает. До Start() (конфиг читается раньше запуска таймера) её сделает
+                // первая проверка, а после Stop() (окно настроек ещё открыто, OBS выгружает плагин) создавать volmeter нельзя
+                if (_running)
+                {
+                    foreach (var filter in Filters) TryAttach(filter);
+                }
             }
         }
 
         private static void TryAttach(FilterRuntime filter)
         {
             string sourceName = filter.Config.source_name;
-            if (string.IsNullOrWhiteSpace(sourceName) || filter.Volmeter != IntPtr.Zero) return;
+            if (!filter.Config.enabled || string.IsNullOrWhiteSpace(sourceName) || filter.Volmeter != IntPtr.Zero) return;
 
-            IntPtr source = obs_get_source_by_name(sourceName);
+            IntPtr source;
+            try
+            {
+                source = obs_get_source_by_name(sourceName);
+            }
+            catch (Exception ex)
+            {
+                // например, нет obs.dll (проверки вне OBS): привязка не получилась, но остальные фильтры работают
+                LogAttachProblemOnce(filter, $"Cannot look up OBS source '{sourceName}': {ex.Message}", isError: true);
+                return;
+            }
+
             if (source == IntPtr.Zero)
             {
                 LogAttachProblemOnce(filter, $"OBS source '{sourceName}' not found! Will retry searching on tick.", isError: false);
@@ -292,57 +328,100 @@ namespace ProcessMuterByChannel
 
         private static int _tickCounter;
 
+        private static long _lastTickErrorMs;
+
         private static void OnTimerTick(object? state)
         {
-            lock (SyncLock)
+            // Если прошлая проверка ещё идёт (медленный ответ звуковой подсистемы) или окно настроек меняет фильтры,
+            // эту проверку пропускаем: иначе вызовы таймера копились бы в очереди и занимали бы потоки пула.
+            // Исключение здесь убило бы весь процесс OBS, поэтому наружу оно не выходит
+            if (!Monitor.TryEnter(SyncLock)) return;
+            try
             {
-                if (!_running) return;
-
-                long now = Environment.TickCount64;
-
-                // Перепривязываем volmeter, если источник появился позже или отвалился (не на каждом тике)
-                if (_tickCounter++ % AttachRetryEveryTicks == 0)
-                {
-                    foreach (var filter in Filters) TryAttach(filter);
-                }
-
-                // Для каждого процесса: есть ли звук выше порога хотя бы в одном его фильтре
-                var levels = new Dictionary<string, ProcessLevel>(StringComparer.OrdinalIgnoreCase);
-                foreach (var filter in Filters)
-                {
-                    // максимум берём всегда, чтобы накопленное значение не копилось у неактивных фильтров
-                    float db = filter.TakePeak();
-
-                    string process = filter.Config.TargetKey;
-                    if (process.Length == 0) continue;
-
-                    // источник, за которым сами следим, глушить нельзя: его громкость влияла бы на измеряемый уровень
-                    if (filter.Config.TargetsObsSource
-                        && string.Equals(filter.Config.target_source, filter.Config.source_name, StringComparison.OrdinalIgnoreCase)) continue;
-
-                    float threshold = filter.Config.threshold_db;
-                    bool over = filter.Volmeter != IntPtr.Zero && db > threshold;
-
-                    if (!levels.TryGetValue(process, out var level))
-                    {
-                        level = new ProcessLevel { Source = filter.Config.source_name, PeakDb = db, ThresholdDb = threshold };
-                    }
-                    else if (db - threshold > level.PeakDb - level.ThresholdDb)
-                    {
-                        // в журнале показываем фильтр, который ближе всего к порогу или выше него
-                        level.Source = filter.Config.source_name;
-                        level.PeakDb = db;
-                        level.ThresholdDb = threshold;
-                    }
-
-                    level.Over |= over;
-                    level.FadeMs = Math.Max(level.FadeMs, filter.Config.fade_ms);
-                    level.HoldMs = Math.Max(level.HoldMs, filter.Config.hold_ms);
-                    levels[process] = level;
-                }
-
-                Engine.Tick(now, levels);
+                TickLocked();
             }
+            catch (Exception ex)
+            {
+                long now = Environment.TickCount64;
+                if (now - _lastTickErrorMs > 10000)
+                {
+                    _lastTickErrorMs = now;
+                    Plugin.LogError($"Timer tick failed: {ex}");
+                }
+            }
+            finally
+            {
+                Monitor.Exit(SyncLock);
+            }
+        }
+
+        /// <summary>Вызывается в начале каждой проверки. Нужен только проверкам, чтобы вызвать сбой внутри таймера</summary>
+        internal static Action? TickHook { get; set; }
+
+        private static void TickLocked()
+        {
+            if (!_running) return;
+            TickHook?.Invoke();
+
+            long now = Environment.TickCount64;
+
+            // Перепривязываем volmeter, если источник появился позже или отвалился (не на каждом тике)
+            if (_tickCounter++ % AttachRetryEveryTicks == 0)
+            {
+                foreach (var filter in Filters) TryAttach(filter);
+            }
+
+            // максимум берём у всех фильтров, в том числе выключенных, чтобы накопленное значение не копилось
+            var inputs = new List<(FilterConfig Config, float PeakDb, bool Attached)>(Filters.Count);
+            foreach (var filter in Filters) inputs.Add((filter.Config, filter.TakePeak(), filter.Volmeter != IntPtr.Zero));
+
+            Engine.Tick(now, BuildLevels(inputs));
+        }
+
+        /// <summary>
+        /// Решение по целям из состояния фильтров: для каждой цели - есть ли звук выше порога хотя бы в одном её фильтре,
+        /// самые низкие уровни приглушения и возврата, самые большие время затухания и задержка. Выключенные фильтры
+        /// и фильтры, цель которых совпадает с отслеживаемым источником, пропускаются.
+        /// </summary>
+        internal static Dictionary<string, ProcessLevel> BuildLevels(IEnumerable<(FilterConfig Config, float PeakDb, bool Attached)> inputs)
+        {
+            var levels = new Dictionary<string, ProcessLevel>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (config, db, attached) in inputs)
+            {
+                if (!config.enabled) continue;
+
+                string process = config.TargetKey;
+                if (process.Length == 0) continue;
+
+                // источник, за которым сами следим, глушить нельзя: его громкость влияла бы на измеряемый уровень
+                if (config.TargetsObsSource
+                    && string.Equals(config.target_source, config.source_name, StringComparison.OrdinalIgnoreCase)) continue;
+
+                float threshold = config.threshold_db;
+                bool over = attached && db > threshold;
+
+                if (!levels.TryGetValue(process, out var level))
+                {
+                    level = new ProcessLevel { Source = config.source_name, PeakDb = db, ThresholdDb = threshold, DuckLevel = config.DuckLevel, RestoreLevel = config.RestoreLevel };
+                }
+                else if (db - threshold > level.PeakDb - level.ThresholdDb)
+                {
+                    // в журнале показываем фильтр, который ближе всего к порогу или выше него
+                    level.Source = config.source_name;
+                    level.PeakDb = db;
+                    level.ThresholdDb = threshold;
+                }
+
+                level.Over |= over;
+                // если одну цель глушат несколько фильтров, берётся самый низкий уровень
+                level.DuckLevel = Math.Min(level.DuckLevel, config.DuckLevel);
+                level.RestoreLevel = Math.Min(level.RestoreLevel, config.RestoreLevel);
+                level.FadeMs = Math.Max(level.FadeMs, config.fade_ms);
+                level.HoldMs = Math.Max(level.HoldMs, config.hold_ms);
+                levels[process] = level;
+            }
+
+            return levels;
         }
     }
 }

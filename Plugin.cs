@@ -8,6 +8,7 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
+using System.Windows.Forms;
 
 namespace ProcessMuterByChannel
 {
@@ -42,8 +43,13 @@ namespace ProcessMuterByChannel
         public static void LogWarn(string msg) => WriteLog("WARN", msg);
         public static void LogError(string msg) => WriteLog("ERROR", msg);
 
+        /// <summary>Выключается в проверках, чтобы они не писали в настоящий журнал плагина</summary>
+        internal static bool LogEnabled { get; set; } = true;
+
         private static void WriteLog(string level, string message)
         {
+            if (!LogEnabled) return;
+
             lock (LogLock)
             {
                 try
@@ -58,6 +64,9 @@ namespace ProcessMuterByChannel
         // --- OBS Native Imports ---
         [DllImport("obs", CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr obs_module_get_config_path(IntPtr module, [MarshalAs(UnmanagedType.LPStr)] string file);
+
+        [DllImport("obs", CallingConvention = CallingConvention.Cdecl)]
+        private static extern void bfree(IntPtr ptr);
 
         [DllImport("obs-frontend-api", CallingConvention = CallingConvention.Cdecl)]
         private static extern void obs_frontend_add_tools_menu_item(
@@ -96,6 +105,7 @@ namespace ProcessMuterByChannel
         [UnmanagedCallersOnly(EntryPoint = "obs_module_load", CallConvs = new[] { typeof(CallConvCdecl) })]
         public static bool ObsModuleLoad()
         {
+            RotateLogIfLarge();
             LogInfo("===========================================");
             LogInfo("=== Plugin ObsModuleLoad Executing ===");
             LogInfo($"Log File Path: {LogFilePath}");
@@ -110,9 +120,18 @@ namespace ProcessMuterByChannel
                 LogError($"Failed to register menu item: {ex.Message}");
             }
 
+            // Раздельно: сбой чтения настроек не должен лишать плагин таймера (он тогда хотя бы заработает с настройками из окна)
             try
             {
                 LoadConfig();
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to load the config: {ex.Message}");
+            }
+
+            try
+            {
                 AudioMuterManager.Start();
                 LogInfo("AudioMuterManager started successfully.");
             }
@@ -128,23 +147,70 @@ namespace ProcessMuterByChannel
         public static void ObsModuleUnload()
         {
             LogInfo("=== Plugin ObsModuleUnload ===");
-            AudioMuterManager.Stop();
+            try
+            {
+                CloseSettingsWindow();
+                AudioMuterManager.Stop();
+            }
+            catch (Exception ex)
+            {
+                // исключение из экспортируемого метода уронило бы OBS при выходе
+                LogError($"Error during unload: {ex.Message}");
+            }
         }
+
+        /// <summary>Путь к config.json вместо выданного OBS (для проверок вне OBS)</summary>
+        internal static string? ConfigPathOverride { get; set; }
 
         private static string GetConfigFilePath()
         {
+            if (ConfigPathOverride != null) return ConfigPathOverride;
             if (ModuleContext == IntPtr.Zero) return "process_muter_config.json";
-            IntPtr pathPtr = obs_module_get_config_path(ModuleContext, "config.json");
 
-            string path = Marshal.PtrToStringUTF8(pathPtr) ?? "process_muter_config.json";
-
-            string? dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            // Если OBS не отдал папку настроек или её нельзя создать, плагин не должен падать (этот путь нужен ещё при
+            // создании движка громкости: исключение там сделало бы AudioMuterManager непригодным до перезапуска OBS)
+            try
             {
-                Directory.CreateDirectory(dir);
+                IntPtr pathPtr = obs_module_get_config_path(ModuleContext, "config.json");
+                string? path = pathPtr != IntPtr.Zero ? Marshal.PtrToStringUTF8(pathPtr) : null;
+                if (pathPtr != IntPtr.Zero)
+                {
+                    // строка выделена в OBS, освобождать её нужно через bfree; сбой здесь не должен менять путь к конфигу
+                    try { bfree(pathPtr); } catch { }
+                }
+
+                if (!string.IsNullOrEmpty(path))
+                {
+                    string? dir = Path.GetDirectoryName(path);
+                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
+
+                    return path;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to get the OBS config folder: {ex.Message}");
             }
 
-            return path;
+            return FallbackConfigPath();
+        }
+
+        // Запасное место для настроек: папка в профиле пользователя
+        private static string FallbackConfigPath()
+        {
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ProcessMuterByChannel");
+                Directory.CreateDirectory(dir);
+                return Path.Combine(dir, "config.json");
+            }
+            catch
+            {
+                return "process_muter_config.json";
+            }
         }
 
         /// <summary>Путь к служебному файлу плагина рядом с config.json</summary>
@@ -167,28 +233,17 @@ namespace ProcessMuterByChannel
             {
                 string json = File.ReadAllText(configPath, Encoding.UTF8);
 
-                var config = JsonSerializer.Deserialize(json, PluginConfigJsonContext.Default.PluginConfig);
-
-                if (config == null)
+                if (!TryParseConfig(json, out var config, out string? error))
                 {
-                    LogWarn($"Failed to parse config JSON at '{configPath}'.");
+                    // Файл не разобрался (правили вручную с ошибкой или оборвалась запись). Окно настроек при первом
+                    // сохранении перезапишет его пустым списком, поэтому сначала сохраняем копию рядом
+                    LogError($"Config file '{configPath}' is not valid and was not loaded: {error}");
+                    BackupBrokenConfig(configPath);
                     return;
                 }
 
-                var filters = config.filters ?? new List<FilterConfig>();
-
-                // конфиг старого формата (один фильтр без списка) превращаем в фильтр
-                if (filters.Count == 0)
-                {
-                    var legacy = config.MigrateLegacy();
-                    if (legacy != null)
-                    {
-                        filters.Add(legacy);
-                        LogInfo("Migrated legacy config to a filter.");
-                    }
-                }
-
-                ThemeDark = !string.Equals(config.theme, "light", StringComparison.OrdinalIgnoreCase);
+                var filters = ExtractFilters(config!);
+                ThemeDark = !string.Equals(config!.theme, "light", StringComparison.OrdinalIgnoreCase);
 
                 LogInfo($"Loaded config from '{configPath}': {filters.Count} filter(s)");
 
@@ -200,28 +255,93 @@ namespace ProcessMuterByChannel
             }
         }
 
-        public static void SaveConfig(List<FilterConfig> filters)
+        /// <summary>Разбирает текст config.json. false и описание ошибки, если это не JSON нужной формы</summary>
+        internal static bool TryParseConfig(string json, out PluginConfig? config, out string? error)
         {
-            WriteConfig(filters);
-            AudioMuterManager.SetFilters(filters);
-        }
-
-        private static void WriteConfig(List<FilterConfig> filters)
-        {
-            string configPath = GetConfigFilePath();
+            config = null;
+            error = null;
 
             try
             {
+                config = JsonSerializer.Deserialize(json, PluginConfigJsonContext.Default.PluginConfig);
+                if (config == null) error = "the file is empty or contains null";
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+            }
+
+            return config != null;
+        }
+
+        /// <summary>
+        /// Фильтры из разобранного конфига: пустые элементы ("null" в списке) отбрасываются, конфиг самой первой версии
+        /// (один источник и один процесс без списка) превращается в один фильтр
+        /// </summary>
+        internal static List<FilterConfig> ExtractFilters(PluginConfig config)
+        {
+            var filters = new List<FilterConfig>();
+            if (config.filters != null)
+            {
+                foreach (var filter in config.filters)
+                {
+                    if (filter != null) filters.Add(filter);
+                }
+            }
+
+            if (filters.Count == 0)
+            {
+                var legacy = config.MigrateLegacy();
+                if (legacy != null)
+                {
+                    filters.Add(legacy);
+                    LogInfo("Migrated legacy config to a filter.");
+                }
+            }
+
+            return filters;
+        }
+
+        private static void BackupBrokenConfig(string configPath)
+        {
+            try
+            {
+                File.Copy(configPath, configPath + ".broken", overwrite: true);
+                LogWarn($"A copy of the unreadable config was saved to '{configPath}.broken'.");
+            }
+            catch (Exception ex)
+            {
+                LogError($"Could not back up the unreadable config: {ex.Message}");
+            }
+        }
+
+        /// <summary>Записывает конфиг и применяет фильтры. false, если файл записать не удалось (фильтры при этом всё равно применены)</summary>
+        public static bool SaveConfig(List<FilterConfig> filters)
+        {
+            bool written = WriteConfig(filters);
+            AudioMuterManager.SetFilters(filters);
+            return written;
+        }
+
+        private static bool WriteConfig(List<FilterConfig> filters)
+        {
+            string configPath = "";
+
+            try
+            {
+                configPath = GetConfigFilePath();
                 var config = new PluginConfig { filters = filters, theme = ThemeDark ? "dark" : "light" };
 
                 string json = JsonSerializer.Serialize(config, JsonContext.PluginConfig);
-                File.WriteAllText(configPath, json, Encoding.UTF8);
+                AtomicFile.WriteAllText(configPath, json, Encoding.UTF8);
 
                 LogInfo($"Saved config to file '{configPath}': {filters.Count} filter(s)");
+                return true;
             }
             catch (Exception ex)
             {
                 LogError($"Failed to save config to '{configPath}': {ex.Message}");
+                return false;
             }
         }
 
@@ -244,7 +364,16 @@ namespace ProcessMuterByChannel
             {
                 try
                 {
+                    // Исключение в обработчике события окна (таймер, щелчок) иначе открыло бы системное окно ошибки .NET
+                    // поверх OBS, и так на каждый тик таймера. Вместо этого пишем в журнал, и окно продолжает работать
+                    Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException, threadScope: true);
+                    if (Interlocked.Exchange(ref _threadExceptionHooked, 1) == 0)
+                    {
+                        Application.ThreadException += (s, e) => LogError($"Unhandled exception in the settings window: {e.Exception}");
+                    }
+
                     using var form = new SettingsForm(AudioMuterManager.GetFilters());
+                    _settingsForm = form;
                     form.ShowDialog();
                 }
                 catch (Exception ex)
@@ -253,12 +382,56 @@ namespace ProcessMuterByChannel
                 }
                 finally
                 {
+                    _settingsForm = null;
                     Interlocked.Exchange(ref _settingsOpen, 0);
                 }
             });
             thread.IsBackground = true; // окно не должно удерживать процесс OBS при закрытии
             thread.SetApartmentState(ApartmentState.STA);
+            _settingsThread = thread;
             thread.Start();
+        }
+
+        private static int _threadExceptionHooked;
+        private static volatile SettingsForm? _settingsForm;
+        private static Thread? _settingsThread;
+
+        /// <summary>
+        /// Закрывает окно настроек, если оно открыто. Вызывается при выгрузке плагина: окно живёт в своём потоке
+        /// и иначе продолжало бы работать с кодом, который OBS уже выгружает. Закрытие записывает несохранённые правки
+        /// </summary>
+        private static void CloseSettingsWindow()
+        {
+            var form = _settingsForm;
+            var thread = _settingsThread;
+            if (form == null || thread == null || !thread.IsAlive) return;
+
+            try
+            {
+                if (form.IsHandleCreated) form.BeginInvoke(new Action(form.Close));
+                thread.Join(3000);
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to close the settings window: {ex.Message}");
+            }
+        }
+
+        // Журнал растёт, пока плагин жив; при загрузке слишком большой файл откладывается в сторону
+        private static void RotateLogIfLarge()
+        {
+            try
+            {
+                var info = new FileInfo(LogFilePath);
+                if (info.Exists && info.Length > 5 * 1024 * 1024)
+                {
+                    lock (LogLock) File.Move(LogFilePath, LogFilePath + ".old", overwrite: true);
+                }
+            }
+            catch
+            {
+                // журнал не критичен
+            }
         }
     }
 }

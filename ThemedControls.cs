@@ -9,6 +9,9 @@ namespace ProcessMuterByChannel
     // Собственные контролы в стиле OBS (Yami): стандартные ComboBox/Button/GroupBox из WinForms
     // нельзя перекрасить под тему, поэтому они нарисованы вручную по значениям из ObsTheme.
 
+    /// <summary>Оттенок обычной кнопки: слегка красный для опасных действий, слегка зелёный для добавления</summary>
+    internal enum ButtonTone { Normal, Danger, Success }
+
     /// <summary>Кнопка как QPushButton в OBS: скруглённая, меняет фон и рамку при наведении</summary>
     internal sealed class ThemedButton : Control
     {
@@ -18,6 +21,8 @@ namespace ProcessMuterByChannel
 
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public bool Primary { get; set; }
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public ButtonTone Tone { get; set; }
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public bool Round { get; set; }
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -45,11 +50,24 @@ namespace ProcessMuterByChannel
                 border = !Enabled ? ObsTheme.ButtonBg : ObsTheme.PrimaryLight;
                 if (_hover || Focused) border = ObsTheme.ButtonBorderHover;
             }
+            else if (Tone != ButtonTone.Normal && Enabled)
+            {
+                bool danger = Tone == ButtonTone.Danger;
+                Color toneBg = danger ? ObsTheme.DangerBg : ObsTheme.SuccessBg;
+                Color toneHover = danger ? ObsTheme.DangerBgHover : ObsTheme.SuccessBgHover;
+                Color toneBorder = danger ? ObsTheme.DangerBorder : ObsTheme.SuccessBorder;
+                fill = _down ? ObsTheme.ButtonBgDown : _hover ? toneHover : toneBg;
+                border = !_down && (_hover || Focused) ? toneBorder : fill;
+            }
             else
             {
                 fill = !Enabled ? ObsTheme.ButtonBg : _down ? ObsTheme.ButtonBgDown : _hover ? ObsTheme.ButtonBgHover : ObsTheme.ButtonBg;
                 border = Enabled && !_down && (_hover || Focused) ? ObsTheme.ButtonBorderHover : fill;
             }
+
+            // с клавиатуры (Tab) фокус виден отчётливым кольцом; после щелчка мышью кольца нет
+            bool keyboardFocus = Focused && ShowFocusCues && Enabled;
+            if (keyboardFocus) border = ObsTheme.FocusRing;
 
             var rect = new RectangleF(0.5f, 0.5f, Width - 1, Height - 1);
             using (var path = Ui.RoundedRect(rect, Round ? Math.Min(Width, Height) / 2f : Ui.Px(4)))
@@ -60,10 +78,14 @@ namespace ProcessMuterByChannel
                 g.DrawPath(pen, path);
             }
 
-            DrawContent(g, Enabled ? ObsTheme.Text : ObsTheme.TextMuted);
+            Color textColor = Enabled ? ObsTheme.Text : ObsTheme.TextMuted;
+            Color glyphColor = textColor;
+            if (Enabled && Tone == ButtonTone.Danger) glyphColor = ObsTheme.DangerAccent;
+            else if (Enabled && Tone == ButtonTone.Success) glyphColor = ObsTheme.SuccessAccent;
+            DrawContent(g, textColor, glyphColor);
         }
 
-        private void DrawContent(Graphics g, Color color)
+        private void DrawContent(Graphics g, Color color, Color glyphColor)
         {
             const TextFormatFlags flags = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine
                 | TextFormatFlags.VerticalCenter | TextFormatFlags.Left;
@@ -82,7 +104,7 @@ namespace ProcessMuterByChannel
 
             if (glyphWidth > 0)
             {
-                TextRenderer.DrawText(g, Glyph, _iconFont, new Rectangle(x, 0, glyphWidth, Height), color, flags);
+                TextRenderer.DrawText(g, Glyph, _iconFont, new Rectangle(x, 0, glyphWidth, Height), glyphColor, flags);
                 x += glyphWidth + gap;
             }
 
@@ -144,10 +166,12 @@ namespace ProcessMuterByChannel
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(Parent?.BackColor ?? ObsTheme.WindowBg);
 
-            using (var path = Ui.RoundedRect(new RectangleF(0, 0, Width - 1, Height - 1), Ui.Px(4)))
+            using (var path = Ui.RoundedRect(new RectangleF(0.5f, 0.5f, Width - 1, Height - 1), Ui.Px(4)))
             using (var brush = new SolidBrush(ObsTheme.BaseBg))
+            using (var pen = new Pen(ObsTheme.CardBorder, 1f))
             {
                 g.FillPath(brush, path);
+                g.DrawPath(pen, path);
             }
 
             using var bold = Ui.Font(FontStyle.Bold);
@@ -171,8 +195,10 @@ namespace ProcessMuterByChannel
 
         protected abstract bool FocusedInside { get; }
 
-        protected Color FillColor => !Enabled ? ObsTheme.InputBg : FocusedInside ? ObsTheme.InputBgFocus : _hover ? ObsTheme.InputBgHover : ObsTheme.InputBg;
-        protected Color BorderColor => !Enabled ? ObsTheme.InputBg : FocusedInside ? ObsTheme.InputBorderFocus : _hover ? ObsTheme.InputBorderHover : ObsTheme.InputBg;
+        protected bool Hovered => _hover;
+
+        protected virtual Color FillColor => !Enabled ? ObsTheme.InputBg : FocusedInside ? ObsTheme.InputBgFocus : _hover ? ObsTheme.InputBgHover : ObsTheme.InputBg;
+        protected virtual Color BorderColor => !Enabled ? ObsTheme.InputBg : FocusedInside ? ObsTheme.FocusRing : _hover ? ObsTheme.InputBorderHover : ObsTheme.InputBg;
 
         protected virtual void OnStateChanged() { }
 
@@ -234,12 +260,77 @@ namespace ProcessMuterByChannel
             set => _box.Text = value;
         }
 
+        /// <summary>Внутреннее поле ввода: нужно, чтобы поймать Enter и уход фокуса</summary>
+        internal TextBox InnerTextBox => _box;
+
         protected override bool FocusedInside => _box.Focused;
+
+        private bool _flat;
+        private string _suffix = "";
+        private int _rightReserve;
+
+        /// <summary>Плоский вид для заголовка: без рамки и фона, пока на поле нет курсора и фокуса, справа значок карандаша</summary>
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool Flat
+        {
+            get => _flat;
+            set { _flat = value; UpdateReserve(); OnStateChanged(); Invalidate(); }
+        }
+
+        /// <summary>Единица измерения внутри поля справа, например «мс»</summary>
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string Suffix
+        {
+            get => _suffix;
+            set { _suffix = value ?? ""; UpdateReserve(); Invalidate(); }
+        }
+
+        private bool FlatIdle => _flat && !FocusedInside && !Hovered;
+
+        protected override Color FillColor => FlatIdle && Enabled ? ObsTheme.BaseBg : base.FillColor;
+        protected override Color BorderColor => FlatIdle && Enabled ? ObsTheme.BaseBg : base.BorderColor;
+
+        // Место справа под единицу измерения и карандаш; поле ввода его не занимает
+        private void UpdateReserve()
+        {
+            int reserve = 0;
+            if (_suffix.Length > 0) reserve += TextRenderer.MeasureText(_suffix, Font, new Size(int.MaxValue, int.MaxValue), TextFormatFlags.NoPadding).Width + Ui.Px(8);
+            if (_flat) reserve += Ui.Px(26);
+            _rightReserve = reserve;
+            LayoutBox();
+        }
 
         protected override void OnStateChanged()
         {
+            // вызывается и из конструктора базового класса, когда поле ещё не создано
+            if (_box is null) return;
+
             _box.BackColor = FillColor;
             _box.ForeColor = Enabled ? ObsTheme.Text : ObsTheme.TextMuted;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+
+            var g = e.Graphics;
+            const TextFormatFlags flags = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine
+                | TextFormatFlags.VerticalCenter | TextFormatFlags.Right;
+
+            int right = Width - Ui.Px(8);
+            if (_flat && !FocusedInside)
+            {
+                using var icon = Ui.IconFont(0.85f);
+                var color = Hovered ? ObsTheme.Text : ObsTheme.TextMuted;
+                TextRenderer.DrawText(g, Ui.GlyphEdit, icon, new Rectangle(right - Ui.Px(18), 0, Ui.Px(18), Height), color, flags);
+                right -= Ui.Px(26);
+            }
+
+            if (_suffix.Length > 0)
+            {
+                using var small = Ui.Font(scale: 0.92f);
+                TextRenderer.DrawText(g, _suffix, small, new Rectangle(0, 0, right, Height), ObsTheme.TextMuted, flags);
+            }
         }
 
         private void LayoutBox()
@@ -247,7 +338,7 @@ namespace ProcessMuterByChannel
             // вызывается из конструктора базового класса, когда поле ещё не создано
             if (_box is null) return;
 
-            _box.SetBounds(Ui.Px(8), Math.Max(0, (Height - _box.Height) / 2), Math.Max(10, Width - Ui.Px(16)), _box.Height);
+            _box.SetBounds(Ui.Px(8), Math.Max(0, (Height - _box.Height) / 2), Math.Max(10, Width - Ui.Px(16) - _rightReserve), _box.Height);
         }
 
         protected override void OnResize(EventArgs e) { base.OnResize(e); LayoutBox(); }

@@ -34,12 +34,13 @@ namespace ProcessMuterByChannel
         }
 
         /// <summary>
-        /// Выставляет громкость аудиосессий процесса как «исходная громкость × factor».
+        /// Выставляет громкость аудиосессий процесса между исходной (factor = 1) и уровнем приглушения duckLevel (factor = 0).
+        /// Если исходная громкость сессии и так ниже duckLevel, она остаётся прежней: приглушение не делает звук громче.
         /// Исходная громкость каждой сессии запоминается в baseVolumes при первом обращении
         /// (сессия, которая появилась позже, запоминается в момент появления).
         /// Возвращает true, если у процесса нашлась хотя бы одна аудиосессия
         /// </summary>
-        public static bool ApplyFactor(string processName, float factor, Dictionary<string, float> baseVolumes)
+        public static bool ApplyFactor(string processName, float factor, float duckLevel, float restoreLevel, Dictionary<string, float> baseVolumes)
         {
             bool applied = false;
 
@@ -68,7 +69,9 @@ namespace ProcessMuterByChannel
                             baseVolumes[key] = baseVolume;
                         }
 
-                        volume.Volume = Math.Clamp(baseVolume * factor, 0.0f, 1.0f);
+                        float duckedVolume = Math.Min(baseVolume, duckLevel);
+                        float restoredVolume = float.IsPositiveInfinity(restoreLevel) ? baseVolume : Math.Max(duckedVolume, restoreLevel);
+                        volume.Volume = Math.Clamp(duckedVolume + (restoredVolume - duckedVolume) * factor, 0.0f, 1.0f);
                         applied = true;
                     }
                     catch
@@ -86,11 +89,11 @@ namespace ProcessMuterByChannel
         }
 
         /// <summary>Возвращает сессиям процесса запомненную громкость и забывает её. true, если сессии нашлись</summary>
-        public static bool RestoreVolume(string processName, Dictionary<string, float> baseVolumes)
+        public static bool RestoreVolume(string processName, float restoreLevel, Dictionary<string, float> baseVolumes)
         {
             if (baseVolumes.Count == 0) return true;
 
-            bool applied = ApplyFactor(processName, 1.0f, baseVolumes);
+            bool applied = ApplyFactor(processName, 1.0f, 0.0f, restoreLevel, baseVolumes);
             baseVolumes.Clear();
             return applied;
         }
@@ -136,7 +139,7 @@ namespace ProcessMuterByChannel
             return found;
         }
 
-        private static bool IsProcessNamed(uint pid, string processName, Dictionary<uint, bool> cache)
+        internal static bool IsProcessNamed(uint pid, string processName, Dictionary<uint, bool> cache)
         {
             if (cache.TryGetValue(pid, out bool known)) return known;
 

@@ -28,7 +28,7 @@ namespace ProcessMuterByChannel
         // Для источника OBS одна громкость и нет «новых сессий», поэтому повторно её применять не нужно
         public bool SupportsEnforce(string target) => false;
 
-        public bool ApplyFactor(string target, float factor, Dictionary<string, float> baseVolumes)
+        public bool ApplyFactor(string target, float factor, float duckLevel, float restoreLevel, Dictionary<string, float> baseVolumes)
         {
             IntPtr source = Find(target);
             if (source == IntPtr.Zero) return false;
@@ -41,8 +41,11 @@ namespace ProcessMuterByChannel
                     baseVolumes[VolumeKey] = baseVolume;
                 }
 
-                // громкость источника в OBS может быть выше 1 (усиление), поэтому сверху не ограничиваем
-                obs_source_set_volume(source, Math.Max(0.0f, baseVolume * factor));
+                // громкость источника в OBS может быть выше 1 (усиление), поэтому сверху не ограничиваем;
+                // если источник и так тише уровня приглушения, он остаётся как есть
+                float duckedVolume = Math.Min(baseVolume, Math.Max(0.0f, duckLevel));
+                float restoredVolume = float.IsPositiveInfinity(restoreLevel) ? baseVolume : Math.Max(duckedVolume, restoreLevel);
+                obs_source_set_volume(source, Math.Max(0.0f, duckedVolume + (restoredVolume - duckedVolume) * factor));
                 return true;
             }
             catch (Exception ex)
@@ -56,11 +59,11 @@ namespace ProcessMuterByChannel
             }
         }
 
-        public bool RestoreVolume(string target, Dictionary<string, float> baseVolumes)
+        public bool RestoreVolume(string target, float restoreLevel, Dictionary<string, float> baseVolumes)
         {
             if (baseVolumes.Count == 0) return true;
 
-            bool applied = ApplyFactor(target, 1.0f, baseVolumes);
+            bool applied = ApplyFactor(target, 1.0f, 0.0f, restoreLevel, baseVolumes);
             baseVolumes.Clear();
             return applied;
         }
@@ -109,8 +112,8 @@ namespace ProcessMuterByChannel
         private IVolumeBackend For(string target) => target.StartsWith(ObsSourceBackend.Prefix, StringComparison.Ordinal) ? _obs : _process;
 
         public bool SupportsEnforce(string target) => For(target).SupportsEnforce(target);
-        public bool ApplyFactor(string target, float factor, Dictionary<string, float> baseVolumes) => For(target).ApplyFactor(target, factor, baseVolumes);
-        public bool RestoreVolume(string target, Dictionary<string, float> baseVolumes) => For(target).RestoreVolume(target, baseVolumes);
+        public bool ApplyFactor(string target, float factor, float duckLevel, float restoreLevel, Dictionary<string, float> baseVolumes) => For(target).ApplyFactor(target, factor, duckLevel, restoreLevel, baseVolumes);
+        public bool RestoreVolume(string target, float restoreLevel, Dictionary<string, float> baseVolumes) => For(target).RestoreVolume(target, restoreLevel, baseVolumes);
         public bool Recover(string target, float baseVolume) => For(target).Recover(target, baseVolume);
     }
 
@@ -128,6 +131,10 @@ namespace ProcessMuterByChannel
     /// </summary>
     internal sealed class RecoveryStore : IRecoveryStore
     {
+        // Громкость источника OBS бывает выше 1 (усиление до +26 дБ, около 20 раз). Всё, что больше, в файле испорчено:
+        // такое значение не должно оглушить стрим при восстановлении
+        public const float MaxVolume = 20.0f;
+
         private readonly string _path;
         private readonly object _lock = new object();
 
@@ -148,7 +155,8 @@ namespace ProcessMuterByChannel
 
                     if (float.TryParse(line.AsSpan(0, tab), NumberStyles.Float, CultureInfo.InvariantCulture, out float volume) && float.IsFinite(volume))
                     {
-                        result[line.Substring(tab + 1)] = volume;
+                        string key = line.Substring(tab + 1).TrimEnd('\r');
+                        if (key.Length > 0) result[key] = Math.Clamp(volume, 0.0f, MaxVolume);
                     }
                 }
             }
@@ -172,9 +180,14 @@ namespace ProcessMuterByChannel
                         return;
                     }
 
-                    var lines = new List<string>(entries.Count);
-                    foreach (var (key, volume) in entries) lines.Add(volume.ToString("R", CultureInfo.InvariantCulture) + "\t" + key);
-                    File.WriteAllLines(_path, lines);
+                    var text = new System.Text.StringBuilder();
+                    foreach (var (key, volume) in entries)
+                    {
+                        // перевод строки в имени сломал бы формат «одна запись на строку»
+                        string safeKey = key.Replace('\r', ' ').Replace('\n', ' ');
+                        text.Append(volume.ToString("R", CultureInfo.InvariantCulture)).Append('\t').Append(safeKey).Append('\n');
+                    }
+                    AtomicFile.WriteAllText(_path, text.ToString());
                 }
                 catch (Exception ex)
                 {

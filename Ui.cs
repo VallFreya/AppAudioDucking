@@ -66,6 +66,9 @@ namespace ProcessMuterByChannel
         public static string GlyphRefresh => HasIconFont ? "" : "↻";
         public static string GlyphDelete => HasIconFont ? "" : "✕";
 
+        public static string GlyphCopy => HasIconFont ? "" : "⧉";
+        public static string GlyphEdit => HasIconFont ? "" : "✎";
+
         public static Font IconFont(float scale = 1f)
         {
             return new Font(IconFontName, ObsTheme.FontPt * 96f / 72f * K * scale, FontStyle.Regular, GraphicsUnit.Pixel);

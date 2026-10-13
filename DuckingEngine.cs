@@ -13,13 +13,17 @@ namespace ProcessMuterByChannel
         bool SupportsEnforce(string target);
 
         /// <summary>
-        /// Выставляет громкость цели как «исходная × factor», запоминая исходную в baseVolumes.
+        /// Выставляет громкость цели между исходной (factor = 1) и уровнем приглушения (factor = 0), запоминая исходную в baseVolumes.
+        /// duckLevel - абсолютная громкость при полном приглушении (0..1, у источника OBS бывает и выше). Если исходная громкость
+        /// и так ниже duckLevel, цель не трогается: приглушение не должно делать звук громче.
+        /// restoreLevel - абсолютная громкость, до которой цель возвращается при factor = 1, даже если она выше исходной
+        /// (float.PositiveInfinity: до исходной громкости). Не ниже уровня приглушения.
         /// Возвращает true, если цель найдена (у процесса есть аудиосессия, источник OBS существует)
         /// </summary>
-        bool ApplyFactor(string target, float factor, Dictionary<string, float> baseVolumes);
+        bool ApplyFactor(string target, float factor, float duckLevel, float restoreLevel, Dictionary<string, float> baseVolumes);
 
         /// <summary>Возвращает исходную громкость и забывает её. true, если цель была найдена</summary>
-        bool RestoreVolume(string target, Dictionary<string, float> baseVolumes);
+        bool RestoreVolume(string target, float restoreLevel, Dictionary<string, float> baseVolumes);
 
         /// <summary>Поднимает громкость до baseVolume, если она осталась сниженной после аварийного выхода. true, если цель найдена</summary>
         bool Recover(string target, float baseVolume);
@@ -29,14 +33,25 @@ namespace ProcessMuterByChannel
     {
         public bool SupportsEnforce(string target) => true;
 
-        public bool ApplyFactor(string target, float factor, Dictionary<string, float> baseVolumes)
-            => ProcessAudioControl.ApplyFactor(target, factor, baseVolumes);
+        public bool ApplyFactor(string target, float factor, float duckLevel, float restoreLevel, Dictionary<string, float> baseVolumes)
+            => ProcessAudioControl.ApplyFactor(target, factor, duckLevel, restoreLevel, baseVolumes);
 
-        public bool RestoreVolume(string target, Dictionary<string, float> baseVolumes)
-            => ProcessAudioControl.RestoreVolume(target, baseVolumes);
+        public bool RestoreVolume(string target, float restoreLevel, Dictionary<string, float> baseVolumes)
+            => ProcessAudioControl.RestoreVolume(target, restoreLevel, baseVolumes);
 
         public bool Recover(string target, float baseVolume)
             => ProcessAudioControl.RecoverVolume(target, baseVolume);
+    }
+
+    /// <summary>
+    /// Кто-то ещё, кроме движка, временно меняет громкость цели (предпросмотр в окне настроек). Когда движок начинает
+    /// приглушать такую цель, он должен взять за исходную громкость ту, что была до этого временного изменения,
+    /// а не уже сниженную, и забрать управление себе.
+    /// </summary>
+    internal interface IExternalVolumeOwner
+    {
+        /// <summary>Забирает управление громкостью цели. Возвращает исходные громкости сессий или null, если цель никем не занята</summary>
+        Dictionary<string, float>? TakeOver(string target);
     }
 
     /// <summary>Что известно о цели на текущей проверке: есть ли звук выше порога хотя бы в одном её фильтре</summary>
@@ -49,6 +64,10 @@ namespace ProcessMuterByChannel
         public string Source;
         public float PeakDb;
         public float ThresholdDb;
+        // Абсолютная громкость цели при приглушении (0 - полная тишина)
+        public float DuckLevel;
+        // Абсолютная громкость, до которой цель возвращается; бесконечность - до исходной
+        public float RestoreLevel;
     }
 
     /// <summary>
@@ -73,6 +92,9 @@ namespace ProcessMuterByChannel
             public readonly object Gate = new object();
             // Во сколько раз сейчас снижена громкость относительно исходной (1 = без изменений)
             public float Factor = 1.0f;
+            // Абсолютная громкость при полном приглушении (меняется настройкой фильтра, пока цель приглушена)
+            public float DuckLevel;
+            public float RestoreLevel;
             // Исходные громкости цели, запоминаются на время приглушения
             public readonly Dictionary<string, float> BaseVolumes = new Dictionary<string, float>();
             // Исходная громкость уже записана в файл восстановления
@@ -86,6 +108,7 @@ namespace ProcessMuterByChannel
         private readonly IVolumeBackend _backend;
         private readonly Action<string> _log;
         private readonly int _enforceEveryMs;
+        private readonly IExternalVolumeOwner? _external;
 
         // Восстановление громкости после аварийного выхода: цель → исходная громкость
         private readonly IRecoveryStore? _store;
@@ -104,13 +127,14 @@ namespace ProcessMuterByChannel
         /// <param name="store">Файл восстановления. Если в нём остались записи прошлого запуска, громкость этих целей будет возвращена</param>
         /// <param name="recoverWindowMs">Сколько ждать появления цели (источники OBS загружаются позже плагина), прежде чем отказаться</param>
         public DuckingEngine(IVolumeBackend backend, Action<string> log, int enforceEveryMs = 300,
-            IRecoveryStore? store = null, int recoverWindowMs = 600000)
+            IRecoveryStore? store = null, int recoverWindowMs = 600000, IExternalVolumeOwner? external = null)
         {
             _backend = backend;
             _log = log;
             _enforceEveryMs = enforceEveryMs;
             _store = store;
             _recoverWindowMs = recoverWindowMs;
+            _external = external;
 
             if (store != null)
             {
@@ -135,6 +159,26 @@ namespace ProcessMuterByChannel
             lock (state.Gate) return state.Factor;
         }
 
+        private static bool SameLevel(float a, float b) =>
+            a == b || (float.IsFinite(a) && float.IsFinite(b) && Math.Abs(a - b) <= 0.0005f);
+
+        /// <summary>
+        /// Цель сейчас приглушена или возвращается из приглушения: громкостью управляет движок. В этом случае возвращает
+        /// исходную (запомненную до приглушения) громкость, чтобы окно настроек не принимало приглушённую за исходную.
+        /// </summary>
+        public bool TryGetDuckedOriginal(string target, out float original)
+        {
+            original = 0.0f;
+            if (!_processes.TryGetValue(target, out var state)) return false;
+
+            lock (state.Gate)
+            {
+                if (state.Factor >= 1.0f && !state.IsMuted) return false;
+                if (state.BaseVolumes.Count > 0) original = state.BaseVolumes.Values.Max();
+                return true;
+            }
+        }
+
         /// <summary>Одна проверка: levels - по записи на каждую цель, упомянутую в фильтрах</summary>
         public void Tick(long now, IReadOnlyDictionary<string, ProcessLevel> levels)
         {
@@ -142,58 +186,120 @@ namespace ProcessMuterByChannel
 
             foreach (var (process, level) in levels)
             {
-                // пока громкость этой цели не возвращена после прошлого запуска, глушить её нельзя:
-                // иначе в качестве исходной запомнилась бы уже сниженная громкость
-                if (_leftovers.Contains(process)) continue;
-
-                _processes.TryGetValue(process, out var state);
-                bool isMuted = state?.IsMuted ?? false;
-
-                if (level.Over && state != null) state.LastActiveMs = now;
-
-                // Возврат звука откладывается: пока с последнего звука прошло меньше HoldMs, держим приглушение.
-                // Так паузы в источнике (речь, TTS, оповещения) не вызывают возврат и повторное приглушение
-                bool holding = isMuted && !level.Over && state != null && now - state.LastActiveMs < level.HoldMs;
-                bool shouldMute = level.Over || holding;
-
-                if (shouldMute != isMuted)
+                try
                 {
-                    state ??= _processes[process] = new ProcessState();
-                    state.IsMuted = shouldMute;
-                    if (shouldMute)
-                    {
-                        state.LastActiveMs = now;
-                        state.MutedSinceMs = now;
-                        state.LastStatusLogMs = now;
-                        _log($"Mute '{process}': '{level.Source}' {level.PeakDb:F1}dB > {level.ThresholdDb:F1}dB");
-                    }
-                    else
-                    {
-                        _log($"Unmute '{process}': no sound above threshold for {now - state.LastActiveMs} ms (hold {level.HoldMs} ms)");
-                    }
-
-                    state.Cts?.Cancel();
-                    var cts = state.Cts = new CancellationTokenSource();
-                    var stateForFade = state;
-                    float target = shouldMute ? 0.0f : 1.0f;
-                    int durationMs = level.FadeMs;
-                    Task.Run(() => FadeAsync(process, stateForFade, target, durationMs, cts.Token));
+                    TickTarget(now, process, level);
                 }
-                else if (state != null && isMuted)
+                catch (Exception ex)
                 {
-                    // Долгое приглушение: раз в несколько секунд пишем, что его держит, чтобы это было видно в журнале
-                    if (now - state.LastStatusLogMs >= StatusLogEveryMs)
-                    {
-                        state.LastStatusLogMs = now;
-                        string why = level.Over
-                            ? $"'{level.Source}' {level.PeakDb:F1}dB > {level.ThresholdDb:F1}dB"
-                            : $"waiting {Math.Max(0, level.HoldMs - (now - state.LastActiveMs))} ms of silence";
-                        _log($"Still muted '{process}' for {(now - state.MutedSinceMs) / 1000} s: {why}");
-                    }
+                    // сбой одной цели (например, COM-ошибка Windows) не должен останавливать остальные
+                    LogTickError(now, process, ex);
                 }
             }
 
             Enforce(now);
+        }
+
+        // Решение по одной цели: когда глушить, когда возвращать
+        private void TickTarget(long now, string process, ProcessLevel level)
+        {
+            // пока громкость этой цели не возвращена после прошлого запуска, глушить её нельзя:
+            // иначе в качестве исходной запомнилась бы уже сниженная громкость
+            if (_leftovers.Contains(process)) return;
+
+            _processes.TryGetValue(process, out var state);
+            bool isMuted = state?.IsMuted ?? false;
+
+            if (level.Over && state != null) state.LastActiveMs = now;
+
+            // уровень приглушения изменили в настройках, пока цель приглушена: применяем сразу
+            if (state != null && (Math.Abs(state.DuckLevel - level.DuckLevel) > 0.0005f || !SameLevel(state.RestoreLevel, level.RestoreLevel)))
+            {
+                lock (state.Gate)
+                {
+                    state.DuckLevel = level.DuckLevel;
+                    state.RestoreLevel = level.RestoreLevel;
+                    if (state.Factor < 1.0f) _backend.ApplyFactor(process, state.Factor, state.DuckLevel, state.RestoreLevel, state.BaseVolumes);
+                }
+            }
+
+            // Возврат звука откладывается: пока с последнего звука прошло меньше HoldMs, держим приглушение.
+            // Так паузы в источнике (речь, TTS, оповещения) не вызывают возврат и повторное приглушение
+            bool holding = isMuted && !level.Over && state != null && now - state.LastActiveMs < level.HoldMs;
+            bool shouldMute = level.Over || holding;
+
+            if (shouldMute != isMuted)
+            {
+                state ??= _processes[process] = new ProcessState { DuckLevel = level.DuckLevel, RestoreLevel = level.RestoreLevel };
+                state.IsMuted = shouldMute;
+                if (shouldMute)
+                {
+                    state.LastActiveMs = now;
+                    state.MutedSinceMs = now;
+                    state.LastStatusLogMs = now;
+                    _log($"Mute '{process}': '{level.Source}' {level.PeakDb:F1}dB > {level.ThresholdDb:F1}dB");
+                }
+                else
+                {
+                    _log($"Unmute '{process}': no sound above threshold for {now - state.LastActiveMs} ms (hold {level.HoldMs} ms)");
+                }
+
+                if (shouldMute) AdoptExternalBases(process, state);
+
+                state.Cts?.Cancel();
+                var cts = state.Cts = new CancellationTokenSource();
+                var stateForFade = state;
+                float target = shouldMute ? 0.0f : 1.0f;
+                int durationMs = level.FadeMs;
+                Task.Run(() => FadeAsync(process, stateForFade, target, durationMs, cts.Token));
+            }
+            else if (state != null && isMuted)
+            {
+                // Долгое приглушение: раз в несколько секунд пишем, что его держит, чтобы это было видно в журнале
+                if (now - state.LastStatusLogMs >= StatusLogEveryMs)
+                {
+                    state.LastStatusLogMs = now;
+                    string why = level.Over
+                        ? $"'{level.Source}' {level.PeakDb:F1}dB > {level.ThresholdDb:F1}dB"
+                        : $"waiting {Math.Max(0, level.HoldMs - (now - state.LastActiveMs))} ms of silence";
+                    _log($"Still muted '{process}' for {(now - state.MutedSinceMs) / 1000} s: {why}");
+                }
+            }
+        }
+
+        // Если громкость цели в этот момент временно изменена предпросмотром, исходной считается громкость до предпросмотра
+        private void AdoptExternalBases(string target, ProcessState state)
+        {
+            if (_external == null) return;
+
+            Dictionary<string, float>? original;
+            try
+            {
+                original = _external.TakeOver(target);
+            }
+            catch (Exception ex)
+            {
+                _log($"Error taking over '{target}' from the preview: {ex.Message}");
+                return;
+            }
+
+            if (original == null || original.Count == 0) return;
+
+            lock (state.Gate)
+            {
+                if (state.BaseVolumes.Count > 0) return;   // исходные громкости уже запомнены (затухание не завершилось)
+                foreach (var (id, volume) in original) state.BaseVolumes[id] = volume;
+            }
+        }
+
+        // Сообщение об одной и той же ошибке не чаще раза в 10 секунд на цель: тик идёт десять раз в секунду
+        private readonly Dictionary<string, long> _lastTickErrorMs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+        private void LogTickError(long now, string target, Exception ex)
+        {
+            if (_lastTickErrorMs.TryGetValue(target, out long last) && now - last < 10000) return;
+            _lastTickErrorMs[target] = now;
+            _log($"Error while processing '{target}': {ex.Message}");
         }
 
         // Приглушённый процесс периодически получает громкость заново: новая аудиосессия приложения
@@ -206,14 +312,23 @@ namespace ProcessMuterByChannel
             foreach (var (target, state) in _processes)
             {
                 if (now - state.LastEnforceMs < _enforceEveryMs) continue;
-                if (!_backend.SupportsEnforce(target)) continue;
 
-                lock (state.Gate)
+                try
                 {
-                    if (state.Factor >= 1.0f) continue;
+                    if (!_backend.SupportsEnforce(target)) continue;
 
-                    state.LastEnforceMs = now;
-                    _backend.ApplyFactor(target, state.Factor, state.BaseVolumes);
+                    lock (state.Gate)
+                    {
+                        if (state.Factor >= 1.0f) continue;
+
+                        state.LastEnforceMs = now;
+                        _backend.ApplyFactor(target, state.Factor, state.DuckLevel, state.RestoreLevel, state.BaseVolumes);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    state.LastEnforceMs = now;   // повтор не чаще обычного интервала
+                    LogTickError(now, target, ex);
                 }
             }
         }
@@ -238,11 +353,18 @@ namespace ProcessMuterByChannel
 
             state.Cts?.Cancel();
 
-            bool restored, recorded;
+            bool restored = false, recorded;
             lock (state.Gate)
             {
-                // возвращаем исходную громкость, а не 100%
-                restored = _backend.RestoreVolume(name, state.BaseVolumes);
+                // возвращаем исходную громкость, а не 100%. Ошибка при возврате одной цели не должна помешать вернуть остальные
+                try
+                {
+                    restored = _backend.RestoreVolume(name, state.RestoreLevel, state.BaseVolumes);
+                }
+                catch (Exception ex)
+                {
+                    _log($"Error restoring volume of '{name}': {ex.Message}");
+                }
                 state.Factor = 1.0f;
                 recorded = state.RecoveryRecorded;
                 state.RecoveryRecorded = false;
@@ -254,6 +376,12 @@ namespace ProcessMuterByChannel
         }
 
         // --- восстановление после аварийного выхода ---
+
+        /// <summary>Записывает исходную громкость цели в файл восстановления (предпросмотр в окне настроек временно её меняет)</summary>
+        public void NoteRecovery(string key, float baseVolume) => SetRecovery(key, baseVolume);
+
+        /// <summary>Стирает запись о цели: её громкость возвращена</summary>
+        public void ForgetRecovery(string key) => ClearRecovery(key);
 
         private void SetRecovery(string key, float baseVolume)
         {
@@ -285,7 +413,17 @@ namespace ProcessMuterByChannel
                 float volume;
                 lock (_recoveryLock) volume = _recovery.TryGetValue(key, out var v) ? v : 1.0f;
 
-                if (_backend.Recover(key, volume))
+                bool recovered = false;
+                try
+                {
+                    recovered = _backend.Recover(key, volume);
+                }
+                catch (Exception ex)
+                {
+                    LogTickError(now, key, ex);
+                }
+
+                if (recovered)
                 {
                     _log($"Restored volume of '{key}' to {volume:F2} (it was left ducked by the previous session)");
                     _leftovers.Remove(key);
@@ -324,7 +462,9 @@ namespace ProcessMuterByChannel
                 }
 
                 int steps = 20;
-                int stepTime = Math.Max(10, (int)(durationMs * distance) / steps);
+                // double и границы: огромное или отрицательное время затухания (ручная правка конфига) не должно переполнить int,
+                // а затухание не должно тянуться дольше минуты
+                int stepTime = (int)Math.Clamp(Math.Clamp(durationMs, 0, FilterConfig.MaxFadeMs) * (double)distance / steps, 10.0, 5000.0);
                 bool lastApplied = false;
 
                 for (int i = 1; i <= steps; i++)
@@ -335,7 +475,7 @@ namespace ProcessMuterByChannel
                     lock (state.Gate)
                     {
                         if (ct.IsCancellationRequested) return;
-                        lastApplied = _backend.ApplyFactor(target, factor, state.BaseVolumes);
+                        lastApplied = _backend.ApplyFactor(target, factor, state.DuckLevel, state.RestoreLevel, state.BaseVolumes);
                         state.Factor = factor;
 
                         // как только исходная громкость запомнена, сохраняем её в файл восстановления

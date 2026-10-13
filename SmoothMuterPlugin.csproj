@@ -22,4 +22,11 @@
 		<PackageReference Include="NAudio.Wasapi" Version="3.1.0" />
 	</ItemGroup>
 
+	<!-- Проект с проверками лежит внутри папки плагина, но в DLL плагина попадать не должен -->
+	<ItemGroup>
+		<Compile Remove="tests\**" />
+		<EmbeddedResource Remove="tests\**" />
+		<None Remove="tests\**" />
+	</ItemGroup>
+
 </Project>
