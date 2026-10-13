@@ -9,8 +9,8 @@
 - Git.
 
 ```bash
-git clone https://github.com/VallFreya/Obs.ProcessMuterByChannel.git
-cd Obs.ProcessMuterByChannel
+git clone https://github.com/VallFreya/AppAudioDucking.git
+cd AppAudioDucking
 dotnet publish -c Release -r win-x64
 ```
 
